@@ -8,7 +8,7 @@ use crate::error::Error::{CheckError, ParseError};
 use crate::error::Result;
 use crate::io::sums::channel::ChannelReader;
 use crate::io::sums::ObjectSumsBuilder;
-use crate::io::{default_s3_client, Provider};
+use crate::io::{create_s3_client, default_s3_client, Provider};
 use crate::stats::{CheckStats, ChecksumPair, CopyStats, GenerateFileStats, GenerateStats};
 use crate::task::check::{CheckTask, CheckTaskBuilder, GroupBy};
 use crate::task::copy::CopyTaskBuilder;
@@ -19,6 +19,7 @@ use humantime::Duration;
 use parse_size::parse_size;
 use serde::{Deserialize, Serialize};
 use serde_json::{to_string, to_string_pretty};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
@@ -43,6 +44,9 @@ pub struct Command {
     /// Options related to outputting data from the CLI.
     #[command(flatten)]
     pub output: Output,
+    /// Options related to credentials.
+    #[command(flatten)]
+    pub credentials: Credentials,
 }
 
 impl Command {
@@ -81,19 +85,30 @@ impl Command {
             }
         }
 
+        let credentials = &args.credentials;
+        if (credentials.source_credential_provider.is_aws() && credentials.source_profile.is_none())
+            || (credentials.destination_credential_provider.is_aws()
+                && credentials.destination_profile.is_none())
+        {
+            return Err(ParseError(
+                "a profile must be specified when using the `aws-profile` credential provider"
+                    .to_string(),
+            ));
+        }
+
         Ok(())
     }
 
     /// Execute the command from the args.
     pub async fn execute(self) -> Result<()> {
-        let client = Arc::new(default_s3_client().await?);
+        let client = Arc::new(self.credentials.source_client().await?);
 
         let pretty_json = self.output.pretty_json;
         let write_sums_file = self.output.write_sums_file;
         match self.commands {
             Subcommands::Generate(generate_args) => {
                 let (sums, stats) = generate_args
-                    .generate(self.optimization, client, true)
+                    .generate(self.optimization, vec![client], true)
                     .await
                     .inspect_err(|err| {
                         Self::print_stats(err, pretty_json).ok();
@@ -107,20 +122,30 @@ impl Command {
             }
             Subcommands::Check(check_args) => {
                 let output = check_args
-                    .check(self.optimization, client, write_sums_file, false)
+                    .check(self.optimization, write_sums_file, false, vec![client])
                     .await
                     .inspect_err(|err| {
                         Self::print_stats(err, pretty_json).ok();
                     })?;
+
                 Self::print_stats(&output, pretty_json)?;
             }
             Subcommands::Copy(copy_args) => {
+                let destination_client = Arc::new(self.credentials.destination_client().await?);
+
                 let output = copy_args
-                    .copy(client, self.optimization, write_sums_file)
+                    .copy(
+                        client,
+                        destination_client,
+                        self.credentials,
+                        self.optimization,
+                        write_sums_file,
+                    )
                     .await
                     .inspect_err(|err| {
                         Self::print_stats(err, pretty_json).ok();
                     })?;
+
                 Self::print_stats(&output, pretty_json)?;
             }
         }
@@ -199,7 +224,7 @@ impl Generate {
     pub async fn generate(
         self,
         optimization: Optimization,
-        client: Arc<Client>,
+        mut clients: Vec<Arc<Client>>,
         write_sums_file: bool,
     ) -> Result<(Vec<SumsFile>, Option<GenerateStats>)> {
         if self.input[0] == "-" {
@@ -210,7 +235,7 @@ impl Generate {
                 .with_verify(self.verify)
                 .with_context(self.checksum)
                 .with_reader(reader)
-                .with_client(client)
+                .set_client(clients.first().cloned())
                 .build()
                 .await?
                 .run()
@@ -224,12 +249,13 @@ impl Generate {
             let mut check_stats = None;
             let mut generate_stats = vec![];
             let mut sums_files = vec![];
+            let mut errors = HashSet::new();
 
             if self.missing {
                 let now = Instant::now();
                 let (ctxs, group_by) =
-                    Check::comparable_check(self.input.clone(), client.clone()).await?;
-                let (objects, compared, updated) = ctxs.into_inner();
+                    Check::comparable_check(self.input.clone(), clients.clone()).await?;
+                let (objects, compared, updated, api_errors) = ctxs.into_inner();
                 check_stats = Some(CheckStats::new(
                     now.elapsed().as_secs_f64(),
                     group_by,
@@ -237,11 +263,20 @@ impl Generate {
                     objects.to_groups(),
                     updated,
                     None,
+                    api_errors,
                 ));
+
+                if clients.is_empty() {
+                    clients = vec![Arc::new(default_s3_client().await?)];
+                }
 
                 let ctxs = SumCtxPairs::from_comparable(objects)?;
                 if let Some(ctxs) = ctxs {
-                    for ctx in ctxs.into_inner() {
+                    for (ctx, client) in ctxs
+                        .into_inner()
+                        .into_iter()
+                        .zip(clients.clone().into_iter().cycle())
+                    {
                         let (input, ctx) = ctx.into_inner();
                         let task = GenerateTaskBuilder::default()
                             .with_overwrite(self.force_overwrite)
@@ -249,7 +284,7 @@ impl Generate {
                             .with_input_file_name(input)
                             .with_context(vec![ctx])
                             .with_capacity(optimization.channel_capacity)
-                            .with_client(client.clone())
+                            .with_client(client)
                             .set_write(write_sums_file)
                             .build()
                             .await?
@@ -257,25 +292,27 @@ impl Generate {
                             .await?;
 
                         sums_files.push(task.sums_file().clone());
+                        errors.extend(task.api_errors());
                         generate_stats.push(GenerateFileStats::from_task(task));
                     }
                 }
             };
 
-            for input in self.input {
+            for (input, client) in self.input.into_iter().zip(clients.into_iter().cycle()) {
                 let task = GenerateTaskBuilder::default()
                     .with_overwrite(self.force_overwrite)
                     .with_verify(self.verify)
                     .with_input_file_name(input)
                     .with_context(self.checksum.clone())
                     .with_capacity(optimization.channel_capacity)
-                    .with_client(client.clone())
+                    .with_client(client)
                     .set_write(write_sums_file)
                     .build()
                     .await?
                     .run()
                     .await?;
                 sums_files.push(task.sums_file().clone());
+                errors.extend(task.api_errors());
                 generate_stats.push(GenerateFileStats::from_task(task));
             }
 
@@ -285,6 +322,7 @@ impl Generate {
                     now.elapsed().as_secs_f64(),
                     generate_stats,
                     check_stats,
+                    errors,
                 )),
             ))
         }
@@ -317,13 +355,13 @@ impl Check {
     /// Perform a check for comparability on the input files.
     pub async fn comparable_check(
         input: Vec<String>,
-        client: Arc<Client>,
+        clients: Vec<Arc<Client>>,
     ) -> Result<(CheckTask, GroupBy)> {
         Ok((
             CheckTaskBuilder::default()
                 .with_input_files(input)
                 .with_group_by(GroupBy::Comparability)
-                .with_client(client)
+                .with_clients(clients)
                 .build()
                 .await?
                 .run()
@@ -345,9 +383,9 @@ impl Check {
     pub async fn check(
         self,
         optimization: Optimization,
-        client: Arc<Client>,
         write_sums_file: bool,
         verify: bool,
+        clients: Vec<Arc<Client>>,
     ) -> Result<CheckStats> {
         let now = Instant::now();
         let group_by = self.group_by;
@@ -355,10 +393,10 @@ impl Check {
         let builder = CheckTaskBuilder::default()
             .with_group_by(group_by)
             .with_update(self.update)
-            .with_client(client.clone());
+            .with_clients(clients.clone());
         let mut generate_stats = None;
         let builder = if self.missing {
-            let (ctxs, _) = Check::comparable_check(self.input.clone(), client.clone()).await?;
+            let (ctxs, _) = Check::comparable_check(self.input.clone(), clients.clone()).await?;
             let checksum = Check::generate_sums(ctxs);
 
             let (sums, stats) = Generate {
@@ -368,7 +406,7 @@ impl Check {
                 force_overwrite: false,
                 verify,
             }
-            .generate(optimization, client.clone(), write_sums_file)
+            .generate(optimization, clients.clone(), write_sums_file)
             .await?;
             generate_stats = stats;
 
@@ -433,6 +471,40 @@ impl CopyMode {
     pub fn is_download_upload(&self) -> bool {
         matches!(self, CopyMode::DownloadUpload)
     }
+
+    /// Is this a server-side copy operation.
+    pub fn is_server_side(&self) -> bool {
+        matches!(self, CopyMode::ServerSide)
+    }
+}
+
+/// Details of how to locate credentials or specify no credentials needed
+#[derive(Debug, Clone, ValueEnum, Copy, Default, Deserialize, Serialize)]
+pub enum CredentialProvider {
+    /// Use the default mechanism of the SDK that obtains credentials from the system
+    #[default]
+    DefaultEnvironment,
+    /// Explicitly state that we want to attempt operations using no credentials (no SDK signing)
+    NoCredentials,
+    /// An AWS profile name.
+    AwsProfile,
+}
+
+impl CredentialProvider {
+    /// Is this source of credentials one with no credentials (i.e. anonymous unsigned calls)
+    pub fn is_anonymous(&self) -> bool {
+        matches!(self, CredentialProvider::NoCredentials)
+    }
+
+    /// Is this an aws-profile credential provider.
+    pub fn is_aws(&self) -> bool {
+        matches!(self, CredentialProvider::AwsProfile)
+    }
+
+    /// Is this a default credential provider.
+    pub fn is_default(&self) -> bool {
+        matches!(self, CredentialProvider::DefaultEnvironment)
+    }
 }
 
 /// The copy subcommand components.
@@ -485,7 +557,8 @@ pub struct Copy {
 impl Copy {
     pub async fn copy_check(
         &self,
-        client: Arc<Client>,
+        source_client: Arc<Client>,
+        destination_client: Arc<Client>,
         optimization: Optimization,
         verify: bool,
         write_sums_file: bool,
@@ -498,7 +571,12 @@ impl Copy {
             group_by: GroupBy::Equality,
             missing: true,
         }
-        .check(optimization, client, write_sums_file, verify)
+        .check(
+            optimization,
+            write_sums_file,
+            verify,
+            vec![source_client, destination_client],
+        )
         .await?;
 
         Ok(result)
@@ -507,7 +585,9 @@ impl Copy {
     /// Perform the copy sub command from the args.
     pub async fn copy(
         self,
-        client: Arc<Client>,
+        source_client: Arc<Client>,
+        destination_client: Arc<Client>,
+        credentials: Credentials,
         optimization: Optimization,
         write_sums_file: bool,
     ) -> Result<CopyStats> {
@@ -517,7 +597,7 @@ impl Copy {
         if !self.no_skip {
             // Check if it exists in the first place.
             let file_size = ObjectSumsBuilder::default()
-                .set_client(Some(client.clone()))
+                .set_client(Some(source_client.clone()))
                 .build(self.destination.to_string())
                 .await?
                 .file_size()
@@ -529,7 +609,13 @@ impl Copy {
 
             if exists {
                 let check_stats = self
-                    .copy_check(client.clone(), optimization.clone(), false, write_sums_file)
+                    .copy_check(
+                        source_client.clone(),
+                        destination_client.clone(),
+                        optimization.clone(),
+                        false,
+                        write_sums_file,
+                    )
                     .await?;
 
                 if check_stats.groups.len() == 1 {
@@ -543,13 +629,22 @@ impl Copy {
                         skipped: true,
                         sums_mismatch: false,
                         n_retries: 0,
-                        api_errors: vec![],
+                        api_errors: HashSet::new(),
                         check_stats: Some(check_stats),
                     };
                     return Ok(copy_stats);
                 }
             }
         }
+
+        // The copy mode must be download-upload if not using default credential providers.
+        let copy_mode = if credentials.source_credential_provider.is_default()
+            && credentials.destination_credential_provider.is_default()
+        {
+            self.copy_mode
+        } else {
+            CopyMode::DownloadUpload
+        };
 
         let result = CopyTaskBuilder::default()
             .with_source(self.source.to_string())
@@ -558,8 +653,9 @@ impl Copy {
             .with_multipart_threshold(self.multipart_threshold)
             .with_concurrency(self.concurrency)
             .with_part_size(self.part_size)
-            .with_copy_mode(self.copy_mode)
-            .with_client(client.clone())
+            .with_copy_mode(copy_mode)
+            .with_source_client(source_client.clone())
+            .with_destination_client(destination_client.clone())
             .build()
             .await?
             .run()
@@ -569,7 +665,13 @@ impl Copy {
         let sums_mismatch = exists;
         let copy_stats = if !self.no_check {
             let check_stats = self
-                .copy_check(client, optimization, sums_mismatch, write_sums_file)
+                .copy_check(
+                    source_client,
+                    destination_client,
+                    optimization,
+                    sums_mismatch,
+                    write_sums_file,
+                )
                 .await?;
             CopyStats::from_task(
                 result,
@@ -671,4 +773,73 @@ pub struct Output {
     /// destination.
     #[arg(global = true, long, env)]
     pub write_sums_file: bool,
+}
+
+/// Options related to credentials. Options prefixed with `source_` affect `check`, `generate` and
+/// the source of a `copy` command. These options also have an alias without the prefix as they are
+/// used in all commands. Options prefixed with `destination_` only affect the destination of a
+/// `copy` command.
+#[derive(Args, Debug)]
+#[group(required = false)]
+pub struct Credentials {
+    /// The credentials source credentials to use. This affects the credentials used for `check`
+    /// `generate` and the source of a `copy` operation.
+    #[arg(
+        global = true,
+        long,
+        env,
+        default_value = "default-environment",
+        alias = "credential-provider"
+    )]
+    pub source_credential_provider: CredentialProvider,
+    /// The destination credentials to use. This only affects the credentials used for the
+    /// destination of a `copy` operation.
+    #[arg(global = true, long, env, default_value = "default-environment")]
+    pub destination_credential_provider: CredentialProvider,
+    /// The source profile to use if the source credential provider is `aws-profile`.
+    /// This must be specified if using `aws-profile`.
+    #[arg(global = true, long, env, alias = "profile")]
+    pub source_profile: Option<String>,
+    /// The destination profile to use if the destination credential provider is `aws-profile`.
+    /// This must be specified if using `aws-profile`.
+    #[arg(global = true, long, env)]
+    pub destination_profile: Option<String>,
+    /// Set the region for the source credential provider.
+    #[arg(global = true, long, env, alias = "region")]
+    pub source_region: Option<String>,
+    /// Set the region for the source credential provider.
+    #[arg(global = true, long, env)]
+    pub destination_region: Option<String>,
+    /// Set the source endpoint URL for AWS calls. This allows using a different endpoint that
+    /// has an S3-compatible storage API.
+    #[arg(global = true, long, env, alias = "endpoint-url")]
+    pub source_endpoint_url: Option<String>,
+    /// Set the destination endpoint URL for AWS calls. This allows using a different endpoint
+    /// that has an S3-compatible storage API.
+    #[arg(global = true, long, env)]
+    pub destination_endpoint_url: Option<String>,
+}
+
+impl Credentials {
+    /// Construct the source client from the credentials.
+    pub async fn source_client(&self) -> Result<Client> {
+        create_s3_client(
+            &self.source_credential_provider,
+            self.source_profile.as_deref(),
+            self.source_region.as_deref(),
+            self.source_endpoint_url.as_deref(),
+        )
+        .await
+    }
+
+    /// Construct the destination client from the credentials.
+    pub async fn destination_client(&self) -> Result<Client> {
+        create_s3_client(
+            &self.destination_credential_provider,
+            self.destination_profile.as_deref(),
+            self.destination_region.as_deref(),
+            self.destination_endpoint_url.as_deref(),
+        )
+        .await
+    }
 }
